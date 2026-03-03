@@ -1,0 +1,23 @@
+# Output data (file lớn, không đẩy lên)
+output/
+output_test/
+
+# Danh sách 200k ID (tải từ OneDrive, không commit)
+product_ids.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+venv/
+.venv/
+env/
+.env
+*.egg-info/
+.eggs/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
