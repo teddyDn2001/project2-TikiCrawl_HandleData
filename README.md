@@ -14,21 +14,21 @@ Tải thông tin ~200k sản phẩm Tiki từ API, chuẩn hoá mô tả, lưu t
 pip install -r requirements.txt
 ```
 
-## Danh sách Product ID
+## Dữ liệu đầu vào (product_id)
 
-- **OneDrive:** https://1drv.ms/u/s!AukvlU4z92FZgp4xIlzQ4giHVa5Lpw?e=qDXctn  
-- Nếu script không tải được từ OneDrive (quyền/giới hạn), hãy tải file về máy và dùng `--ids-file`.
+- File `product_ids.txt` **không** được đính kèm trong repo do dung lượng lớn (~200k ID).
+- Danh sách ID được cung cấp qua link OneDrive của đề bài:  
+  `https://1drv.ms/u/s!AukvlU4z92FZgp4xIlzQ4giHVa5Lpw?e=qDXctn`
+- Người dùng tự tải file từ OneDrive, hoặc tự chuẩn bị danh sách ID của riêng mình.
 
-Định dạng file: mỗi dòng một product ID (số), hoặc CSV (cột đầu là ID). Có thể bỏ qua dòng trống và dòng bắt đầu bằng `#`.
+Định dạng file:
+
+- Mỗi dòng một `product_id` (số), hoặc CSV với `product_id` ở cột đầu.
+- Có thể bỏ qua dòng trống và dòng bắt đầu bằng `#`.
 
 ## Chạy
 
-**Tự động tải danh sách từ OneDrive (nếu link cho phép):**
-```bash
-python fetch_tiki_products.py
-```
-
-**Dùng file danh sách local:**
+**Dùng file danh sách local (khuyến nghị):**
 ```bash
 python fetch_tiki_products.py --ids-file product_ids.txt
 ```
