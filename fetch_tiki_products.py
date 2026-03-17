@@ -8,13 +8,42 @@ Tải thông tin ~200k sản phẩm Tiki từ API, chuẩn hoá description, lư
 
 import argparse
 import base64
-import json
 import re
 import sys
+import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
+    import orjson as _json_impl
+
+    def json_loads(s: str | bytes):
+        return _json_impl.loads(s)
+
+    def json_dumps(obj) -> str:
+        return _json_impl.dumps(obj).decode("utf-8")
+
+except ImportError:
+    try:
+        import ujson as _json_impl  # type: ignore[no-redef]
+
+        def json_loads(s: str | bytes):
+            return _json_impl.loads(s)
+
+        def json_dumps(obj) -> str:
+            # ujson không hỗ trợ ensure_ascii, trả luôn str
+            return _json_impl.dumps(obj)
+
+    except ImportError:
+        import json as _json_impl  # type: ignore[no-redef]
+
+        def json_loads(s: str | bytes):
+            return _json_impl.loads(s)
+
+        def json_dumps(obj) -> str:
+            return _json_impl.dumps(obj, ensure_ascii=False)
+
+try:    
     import aiohttp
     import asyncio
     HAS_AIOHTTP = True
@@ -29,7 +58,10 @@ API_BASE = "https://api.tiki.vn/product-detail/api/v1/products"
 PRODUCTS_PER_FILE = 1000
 CONCURRENT_REQUESTS = 150
 REQUEST_TIMEOUT = 30
+MAX_REQUESTS_PER_SECOND = 50
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+RAW_OUTPUT_PREFIX = "raw_products"
+CHECKPOINT_FILE = Path(__file__).resolve().parent / "checkpoint_processed_ids.txt"
 ONEDRIVE_SHARE_URL = "https://1drv.ms/u/s!AukvlU4z92FZgp4xIlzQ4giHVa5Lpw?e=qDXctn"
 
 
@@ -56,13 +88,22 @@ def extract_images_urls(images: list | None) -> list[str]:
 
 
 def build_product_record(raw: dict) -> dict | None:
-    """Tạo bản ghi sản phẩm đã chuẩn hoá."""
+    """Tạo bản ghi sản phẩm đã chuẩn hoá.
+
+    Hàm này được dùng ở Stage 2 (cleaning), có thể import từ script khác.
+    """
     try:
+        product_id = raw.get("id")
+        price = raw.get("price")
+        if product_id is None or price is None:
+            # Bắt buộc phải có id và price, nếu thiếu thì bỏ qua.
+            return None
+
         return {
-            "id": raw.get("id"),
+            "id": product_id,
             "name": raw.get("name"),
             "url_key": raw.get("url_key"),
-            "price": raw.get("price"),
+            "price": price,
             "description": normalize_description(raw.get("description")),
             "images_url": extract_images_urls(raw.get("images")),
         }
@@ -71,15 +112,21 @@ def build_product_record(raw: dict) -> dict | None:
 
 
 def _fetch_one_sync(product_id: int | str) -> dict | None:
-    """Gọi API một sản phẩm (chế độ sync)."""
+    """Gọi API một sản phẩm (chế độ sync), trả về raw JSON."""
     url = f"{API_BASE}/{product_id}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; TikiProductFetcher/1.0)"})
     try:
+        # Throttling đơn giản theo MAX_REQUESTS_PER_SECOND
+        time.sleep(1 / MAX_REQUESTS_PER_SECOND)
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             if resp.status != 200:
                 return None
-            data = json.loads(resp.read().decode())
-            return build_product_record(data)
+            try:
+                data = json_loads(resp.read())
+            except Exception:
+                # Lỗi JSON (format không hợp lệ, v.v.)
+                return None
+            return data
     except Exception:
         return None
 
@@ -90,17 +137,45 @@ if HAS_AIOHTTP:
         sem: asyncio.Semaphore,
         product_id: int | str,
     ) -> dict | None:
-        """Gọi API một sản phẩm (async, có giới hạn đồng thời)."""
+        """Gọi API một sản phẩm (async, có giới hạn đồng thời), trả về raw JSON."""
         url = f"{API_BASE}/{product_id}"
         async with sem:
             try:
+                # Throttling đơn giản theo MAX_REQUESTS_PER_SECOND
+                await asyncio.sleep(1 / MAX_REQUESTS_PER_SECOND)
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
                     if resp.status != 200:
                         return None
-                    data = await resp.json()
-                    return build_product_record(data)
-            except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError):
+                    text = await resp.text()
+                    try:
+                        data = json_loads(text)
+                    except Exception:
+                        return None
+                    return data
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 return None
+
+
+def load_checkpoint(path: Path = CHECKPOINT_FILE) -> set[str]:
+    """Đọc danh sách product_id đã xử lý từ checkpoint."""
+    if not path.exists():
+        return set()
+    processed: set[str] = set()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                processed.add(line)
+    return processed
+
+
+def append_checkpoint(ids: list[str], path: Path = CHECKPOINT_FILE) -> None:
+    """Ghi thêm danh sách product_id đã xử lý vào checkpoint."""
+    if not ids:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        for pid in ids:
+            f.write(f"{pid}\n")
 
 
 def load_product_ids_from_file(path: Path) -> list[str]:
@@ -169,7 +244,7 @@ def run_sync(
     products_per_file: int = PRODUCTS_PER_FILE,
     concurrency: int = CONCURRENT_REQUESTS,
 ):
-    """Chạy crawl bằng ThreadPoolExecutor (khi không có aiohttp)."""
+    """Stage 1: Crawl raw data bằng ThreadPoolExecutor (khi không có aiohttp)."""
     output_dir.mkdir(parents=True, exist_ok=True)
     batch: list[dict] = []
     file_index = 0
@@ -186,18 +261,33 @@ def run_sync(
                 print(f"Đã xử lý: {done}/{total}", flush=True)
             while len(batch) >= products_per_file:
                 file_index += 1
-                out_path = output_dir / f"products_{file_index:04d}.json"
+                current_batch = batch[:products_per_file]
+                out_path = output_dir / f"{RAW_OUTPUT_PREFIX}_{file_index:04d}.json"
                 with open(out_path, "w", encoding="utf-8") as f:
-                    json.dump(batch[:products_per_file], f, ensure_ascii=False, indent=0)
+                    f.write(json_dumps(current_batch))
+                # Cập nhật checkpoint cho batch này
+                processed_ids = [
+                    str(item.get("id"))
+                    for item in current_batch
+                    if isinstance(item, dict) and item.get("id") is not None
+                ]
+                append_checkpoint(processed_ids)
                 batch = batch[products_per_file:]
                 print(f"Đã ghi: {out_path}", flush=True)
     if batch:
         file_index += 1
-        out_path = output_dir / f"products_{file_index:04d}.json"
+        current_batch = batch
+        out_path = output_dir / f"{RAW_OUTPUT_PREFIX}_{file_index:04d}.json"
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(batch, f, ensure_ascii=False, indent=0)
+            f.write(json_dumps(current_batch))
+        processed_ids = [
+            str(item.get("id"))
+            for item in current_batch
+            if isinstance(item, dict) and item.get("id") is not None
+        ]
+        append_checkpoint(processed_ids)
         print(f"Đã ghi: {out_path}", flush=True)
-    print("Hoàn tất.")
+    print("Stage 1 (raw crawl, sync) hoàn tất.")
 
 
 async def run(
@@ -206,7 +296,7 @@ async def run(
     products_per_file: int = PRODUCTS_PER_FILE,
     concurrency: int = CONCURRENT_REQUESTS,
 ):
-    """Chạy crawl bằng asyncio + aiohttp."""
+    """Stage 1: Crawl raw data bằng asyncio + aiohttp."""
     output_dir.mkdir(parents=True, exist_ok=True)
     sem = asyncio.Semaphore(concurrency)
     batch: list[dict] = []
@@ -231,18 +321,32 @@ async def run(
                     print(f"Đã xử lý: {done}/{total}", flush=True)
                 while len(batch) >= products_per_file:
                     file_index += 1
-                    out_path = output_dir / f"products_{file_index:04d}.json"
+                    current_batch = batch[:products_per_file]
+                    out_path = output_dir / f"{RAW_OUTPUT_PREFIX}_{file_index:04d}.json"
                     with open(out_path, "w", encoding="utf-8") as f:
-                        json.dump(batch[:products_per_file], f, ensure_ascii=False, indent=0)
+                        f.write(json_dumps(current_batch))
+                    processed_ids = [
+                        str(item.get("id"))
+                        for item in current_batch
+                        if isinstance(item, dict) and item.get("id") is not None
+                    ]
+                    append_checkpoint(processed_ids)
                     batch = batch[products_per_file:]
                     print(f"Đã ghi: {out_path}", flush=True)
         if batch:
             file_index += 1
-            out_path = output_dir / f"products_{file_index:04d}.json"
+            current_batch = batch
+            out_path = output_dir / f"{RAW_OUTPUT_PREFIX}_{file_index:04d}.json"
             with open(out_path, "w", encoding="utf-8") as f:
-                json.dump(batch, f, ensure_ascii=False, indent=0)
+                f.write(json_dumps(current_batch))
+            processed_ids = [
+                str(item.get("id"))
+                for item in current_batch
+                if isinstance(item, dict) and item.get("id") is not None
+            ]
+            append_checkpoint(processed_ids)
             print(f"Đã ghi: {out_path}", flush=True)
-    print("Hoàn tất.")
+    print("Stage 1 (raw crawl, async) hoàn tất.")
 
 
 def main():
@@ -299,6 +403,17 @@ def main():
     if not product_ids:
         print("Không có product ID nào.", file=sys.stderr)
         sys.exit(1)
+
+    # Áp dụng checkpoint: bỏ qua những ID đã xử lý ở lần chạy trước
+    processed_ids = load_checkpoint()
+    if processed_ids:
+        before = len(product_ids)
+        product_ids = [pid for pid in product_ids if pid not in processed_ids]
+        after = len(product_ids)
+        skipped = before - after
+        print(f"Checkpoint: bỏ qua {skipped} ID đã xử lý, còn lại {after} ID cần crawl.")
+    else:
+        print("Checkpoint: chưa có file checkpoint, crawl toàn bộ danh sách ID.")
 
     if HAS_AIOHTTP:
         asyncio.run(

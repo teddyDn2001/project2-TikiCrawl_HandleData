@@ -1,12 +1,17 @@
-# Tiki Product Fetcher
+# Tiki Product Fetcher (Project 2)
 
-Tải thông tin ~200k sản phẩm Tiki từ API, chuẩn hoá mô tả, lưu thành các file JSON (mỗi file ~1000 sản phẩm).
+Tải thông tin ~200k sản phẩm Tiki từ API, **tách pipeline 2 stage** để dễ debug và vận hành ổn định:
+
+- **Stage 1 – Raw Crawl**: crawl & lưu raw JSON từ API (`raw_products_*.json`)
+- **Stage 2 – Clean & Format**: đọc raw, chuẩn hoá và ghi output sạch (`products_*.json`)
 
 ## Yêu cầu
 
 - Python 3.10+
-- **Bắt buộc:** `beautifulsoup4` (chuẩn hoá description).
-- **Khuyến nghị:** `aiohttp` (gọi API đồng thời, nhanh hơn nhiều). Nếu không cài, script dùng `ThreadPoolExecutor` + `urllib` (chậm hơn).
+- `beautifulsoup4`: chuẩn hoá `description` (bỏ HTML, gộp khoảng trắng)
+- Khuyến nghị `aiohttp`: chạy async nhanh hơn
+- `ujson` (optional): tăng tốc xử lý JSON (script sẽ fallback về `json` nếu không có)
+- `pytest`: chạy unit test data quality (unique ID)
 
 ## Cài đặt
 
@@ -16,58 +21,52 @@ pip install -r requirements.txt
 
 ## Dữ liệu đầu vào (product_id)
 
-- File `product_ids.txt` **không** được đính kèm trong repo do dung lượng lớn (~200k ID).
-- Danh sách ID được cung cấp qua link OneDrive của đề bài:  
-  `https://1drv.ms/u/s!AukvlU4z92FZgp4xIlzQ4giHVa5Lpw?e=qDXctn`
-- Người dùng tự tải file từ OneDrive, hoặc tự chuẩn bị danh sách ID của riêng mình.
+- File `product_ids.txt` không commit (dung lượng lớn).
+- Có thể dùng OneDrive share link theo đề bài hoặc tự chuẩn bị danh sách ID.
 
-Định dạng file:
+Định dạng:
 
-- Mỗi dòng một `product_id` (số), hoặc CSV với `product_id` ở cột đầu.
-- Có thể bỏ qua dòng trống và dòng bắt đầu bằng `#`.
+- Mỗi dòng 1 `product_id` (số), hoặc CSV với `product_id` ở cột đầu.
+- Bỏ qua dòng trống và dòng bắt đầu bằng `#`.
 
-## Chạy
+## Chạy pipeline
 
-**Dùng file danh sách local (khuyến nghị):**
+### Cách 1: Dùng `entrypoint.sh` (auto-restart)
+
 ```bash
-python fetch_tiki_products.py --ids-file product_ids.txt
+chmod +x entrypoint.sh
+IDS_FILE=product_ids.txt OUTPUT_DIR=output RETRY_DELAY=10 ./entrypoint.sh
 ```
 
-**Tuỳ chọn:**
-- `--output-dir`: thư mục lưu file JSON (mặc định: `./output`)
-- `--per-file`: số sản phẩm mỗi file (mặc định: 1000)
-- `--concurrency`: số request đồng thời (mặc định: 150, tăng để nhanh hơn nếu API chấp nhận)
+### Cách 2: Chạy từng stage
 
-Ví dụ:
+**Stage 1 – Raw crawl (có throttling + checkpoint):**
+
 ```bash
-python fetch_tiki_products.py --ids-file product_ids.txt --output-dir ./data --concurrency 200
+python fetch_tiki_products.py --ids-file product_ids.txt --output-dir ./output
 ```
 
-## Dữ liệu lấy được
+**Stage 2 – Clean & format:**
 
-Mỗi sản phẩm trong JSON gồm:
+```bash
+python clean_tiki_products.py --raw-dir ./output --output-dir ./output
+```
 
-| Trường | Mô tả |
-|--------|--------|
-| `id` | ID sản phẩm |
-| `name` | Tên sản phẩm |
-| `url_key` | Slug URL |
-| `price` | Giá (VNĐ) |
-| `description` | Mô tả đã chuẩn hoá (bỏ HTML, gộp khoảng trắng) |
-| `images_url` | Danh sách URL ảnh (ưu tiên ảnh lớn) |
+## Throttling & checkpoint
 
-## Chuẩn hoá description
-
-- Loại bỏ toàn bộ thẻ HTML.
-- Lấy nội dung text, thay khoảng trắng/nhảy dòng liên tiếp bằng một dấu cách.
-- Decode HTML entities (BeautifulSoup xử lý).
-
-## Rút ngắn thời gian
-
-- Dùng **asyncio + aiohttp** gọi API đồng thời (mặc định 150 request cùng lúc).
-- Có thể tăng `--concurrency` (ví dụ 200–300) nếu API Tiki không chặn; nếu bị 429/block thì giảm xuống.
+- **Throttling**: giới hạn tốc độ để ổn định lâu dài (mặc định ~50 req/s).
+- **Checkpoint**: `checkpoint_processed_ids.txt` lưu các `id` đã crawl xong; chạy lại sẽ tự skip các ID đã xử lý.
 
 ## Output
 
-- Thư mục: `output/` (hoặc theo `--output-dir`).
-- Tên file: `products_0001.json`, `products_0002.json`, ... (mỗi file tối đa 1000 sản phẩm).
+- Stage 1: `raw_products_0001.json`, `raw_products_0002.json`, ...
+- Stage 2: `products_0001.json`, `products_0002.json`, ...
+
+## Unit test: đảm bảo ID duy nhất
+
+Sau khi chạy Stage 2 (có `products_*.json` trong `output/`), chạy:
+
+```bash
+pytest tests/test_unique_ids.py
+```
+
