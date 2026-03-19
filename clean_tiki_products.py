@@ -4,9 +4,25 @@ Stage 2: Đọc dữ liệu raw từ Stage 1, chuẩn hoá và ghi lại thành 
 """
 
 import argparse
+import gc
+import logging
+import os
+import sys
 from pathlib import Path
 
-from fetch_tiki_products import build_product_record, json_loads, json_dumps, OUTPUT_DIR, RAW_OUTPUT_PREFIX, PRODUCTS_PER_FILE
+from dotenv import load_dotenv
+
+from fetch_tiki_products import (
+    build_product_record,
+    json_loads,
+    json_dumps,
+    OUTPUT_DIR,
+    RAW_OUTPUT_PREFIX,
+    PRODUCTS_PER_FILE,
+    LOGS_DIR,
+    setup_logging,
+    atomic_write_text,
+)
 
 
 def clean_raw_files(
@@ -18,14 +34,24 @@ def clean_raw_files(
 
     all_clean: list[dict] = []
     file_index = 0
+    logger = logging.getLogger("tiki_fetcher")
+
+    try:
+        from tqdm import tqdm  # type: ignore
+    except Exception:
+        tqdm = None  # type: ignore
 
     raw_files = sorted(raw_dir.glob(f"{RAW_OUTPUT_PREFIX}_*.json"))
     if not raw_files:
-        print(f"Không tìm thấy file raw nào trong thư mục: {raw_dir}")
+        logger.error("Không tìm thấy file raw nào trong thư mục: %s", raw_dir)
         return
 
-    for raw_path in raw_files:
-        print(f"Đang xử lý file raw: {raw_path}")
+    it = raw_files
+    if tqdm is not None:
+        it = tqdm(raw_files, desc="Stage2 raw files", unit="file")  # type: ignore
+
+    for raw_path in it:  # type: ignore
+        logger.info("Đang xử lý file raw: %s", raw_path)
         with open(raw_path, "r", encoding="utf-8") as f:
             raw_data = json_loads(f.read())
 
@@ -40,22 +66,26 @@ def clean_raw_files(
                 file_index += 1
                 current_batch = all_clean[:products_per_file]
                 out_path = output_dir / f"products_{file_index:04d}.json"
-                with open(out_path, "w", encoding="utf-8") as out_f:
-                    out_f.write(json_dumps(current_batch))
+                atomic_write_text(out_path, json_dumps(current_batch))
                 all_clean = all_clean[products_per_file:]
-                print(f"Đã ghi file sạch: {out_path}")
+                logger.info("Đã ghi file sạch: %s", out_path)
+
+        # giải phóng bộ nhớ sớm
+        del raw_data
+        gc.collect()
 
     if all_clean:
         file_index += 1
         out_path = output_dir / f"products_{file_index:04d}.json"
-        with open(out_path, "w", encoding="utf-8") as out_f:
-            out_f.write(json_dumps(all_clean))
-        print(f"Đã ghi file sạch cuối cùng: {out_path}")
+        atomic_write_text(out_path, json_dumps(all_clean))
+        logger.info("Đã ghi file sạch cuối cùng: %s", out_path)
 
-    print("Stage 2 (clean & format) hoàn tất.")
+    logger.info("Stage 2 (clean & format) hoàn tất.")
 
 
 def main():
+    load_dotenv()
+    setup_logging(LOGS_DIR / "stage2.log")
     parser = argparse.ArgumentParser(description="Stage 2: Chuẩn hoá dữ liệu raw thành products_*.json.")
     parser.add_argument(
         "--raw-dir",
@@ -77,11 +107,15 @@ def main():
     )
     args = parser.parse_args()
 
-    clean_raw_files(
-        raw_dir=args.raw_dir,
-        output_dir=args.output_dir,
-        products_per_file=args.per_file,
-    )
+    try:
+        clean_raw_files(
+            raw_dir=args.raw_dir,
+            output_dir=args.output_dir,
+            products_per_file=args.per_file,
+        )
+    except MemoryError:
+        logging.getLogger("tiki_fetcher").error("Stage 2 MemoryError (thiếu RAM). Hãy giảm --per-file hoặc chạy máy nhiều RAM.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -8,11 +8,15 @@ Tải thông tin ~200k sản phẩm Tiki từ API, chuẩn hoá description, lư
 
 import argparse
 import base64
+import logging
+import os
 import re
 import sys
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from dotenv import load_dotenv
 
 try:
     import orjson as _json_impl
@@ -51,6 +55,7 @@ except ImportError:
     HAS_AIOHTTP = False
 
 import urllib.request
+import urllib.error
 from bs4 import BeautifulSoup
 
 # --- Cấu hình ---
@@ -63,6 +68,50 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 RAW_OUTPUT_PREFIX = "raw_products"
 CHECKPOINT_FILE = Path(__file__).resolve().parent / "checkpoint_processed_ids.txt"
 ONEDRIVE_SHARE_URL = "https://1drv.ms/u/s!AukvlU4z92FZgp4xIlzQ4giHVa5Lpw?e=qDXctn"
+
+LOGS_DIR = Path(__file__).resolve().parent / "logs"
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None or not v.strip():
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
+
+
+def _env_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v if v is not None and v.strip() else default
+
+
+def setup_logging(log_file: Path) -> logging.Logger:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("tiki_fetcher")
+    logger.setLevel(logging.INFO)
+
+    if not logger.handlers:
+        fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(fmt)
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setLevel(logging.INFO)
+        sh.setFormatter(fmt)
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+    return logger
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
 
 
 def normalize_description(html: str | None) -> str:
@@ -115,20 +164,36 @@ def _fetch_one_sync(product_id: int | str) -> dict | None:
     """Gọi API một sản phẩm (chế độ sync), trả về raw JSON."""
     url = f"{API_BASE}/{product_id}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; TikiProductFetcher/1.0)"})
-    try:
-        # Throttling đơn giản theo MAX_REQUESTS_PER_SECOND
-        time.sleep(1 / MAX_REQUESTS_PER_SECOND)
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-            if resp.status != 200:
-                return None
-            try:
-                data = json_loads(resp.read())
-            except Exception:
-                # Lỗi JSON (format không hợp lệ, v.v.)
-                return None
-            return data
-    except Exception:
-        return None
+    max_retries = _env_int("MAX_RETRIES", 5)
+    backoff_base = float(os.getenv("BACKOFF_BASE_SECONDS", "2"))
+    backoff_cap = float(os.getenv("BACKOFF_CAP_SECONDS", "30"))
+
+    for attempt in range(max_retries + 1):
+        try:
+            # Throttling đơn giản theo MAX_REQUESTS_PER_SECOND
+            time.sleep(1 / MAX_REQUESTS_PER_SECOND)
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                if getattr(resp, "status", 200) != 200:
+                    return None
+                try:
+                    data = json_loads(resp.read())
+                except Exception:
+                    return None
+                return data
+        except urllib.error.HTTPError as e:
+            # Exponential backoff cho 429
+            if e.code == 429 and attempt < max_retries:
+                sleep_s = min(backoff_cap, backoff_base * (2**attempt))
+                time.sleep(sleep_s)
+                continue
+            return None
+        except (urllib.error.URLError, TimeoutError):
+            if attempt < max_retries:
+                time.sleep(min(backoff_cap, backoff_base * (2**attempt)))
+                continue
+            return None
+        except Exception:
+            return None
 
 
 if HAS_AIOHTTP:
@@ -139,21 +204,39 @@ if HAS_AIOHTTP:
     ) -> dict | None:
         """Gọi API một sản phẩm (async, có giới hạn đồng thời), trả về raw JSON."""
         url = f"{API_BASE}/{product_id}"
+        max_retries = _env_int("MAX_RETRIES", 5)
+        backoff_base = float(os.getenv("BACKOFF_BASE_SECONDS", "2"))
+        backoff_cap = float(os.getenv("BACKOFF_CAP_SECONDS", "30"))
         async with sem:
-            try:
-                # Throttling đơn giản theo MAX_REQUESTS_PER_SECOND
-                await asyncio.sleep(1 / MAX_REQUESTS_PER_SECOND)
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
-                    if resp.status != 200:
-                        return None
-                    text = await resp.text()
-                    try:
-                        data = json_loads(text)
-                    except Exception:
-                        return None
-                    return data
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                return None
+            for attempt in range(max_retries + 1):
+                try:
+                    # Throttling đơn giản theo MAX_REQUESTS_PER_SECOND
+                    await asyncio.sleep(1 / MAX_REQUESTS_PER_SECOND)
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as resp:
+                        if resp.status == 429 and attempt < max_retries:
+                            sleep_s = min(backoff_cap, backoff_base * (2**attempt))
+                            await asyncio.sleep(sleep_s)
+                            continue
+                        if resp.status != 200:
+                            return None
+                        text = await resp.text()
+                        try:
+                            data = json_loads(text)
+                        except Exception:
+                            return None
+                        return data
+                except asyncio.TimeoutError:
+                    if attempt < max_retries:
+                        await asyncio.sleep(min(backoff_cap, backoff_base * (2**attempt)))
+                        continue
+                    return None
+                except aiohttp.ClientConnectionError:
+                    if attempt < max_retries:
+                        await asyncio.sleep(min(backoff_cap, backoff_base * (2**attempt)))
+                        continue
+                    return None
+                except aiohttp.ClientError:
+                    return None
 
 
 def load_checkpoint(path: Path = CHECKPOINT_FILE) -> set[str]:
@@ -250,6 +333,7 @@ def run_sync(
     file_index = 0
     total = len(product_ids)
     done = 0
+    logger = logging.getLogger("tiki_fetcher")
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {executor.submit(_fetch_one_sync, pid): pid for pid in product_ids}
         for future in as_completed(futures):
@@ -258,13 +342,12 @@ def run_sync(
                 batch.append(r)
             done += 1
             if done % 500 == 0 or done == total:
-                print(f"Đã xử lý: {done}/{total}", flush=True)
+                logger.info("Đã xử lý: %s/%s", done, total)
             while len(batch) >= products_per_file:
                 file_index += 1
                 current_batch = batch[:products_per_file]
                 out_path = output_dir / f"{RAW_OUTPUT_PREFIX}_{file_index:04d}.json"
-                with open(out_path, "w", encoding="utf-8") as f:
-                    f.write(json_dumps(current_batch))
+                atomic_write_text(out_path, json_dumps(current_batch))
                 # Cập nhật checkpoint cho batch này
                 processed_ids = [
                     str(item.get("id"))
@@ -273,21 +356,20 @@ def run_sync(
                 ]
                 append_checkpoint(processed_ids)
                 batch = batch[products_per_file:]
-                print(f"Đã ghi: {out_path}", flush=True)
+                logger.info("Đã ghi: %s", out_path)
     if batch:
         file_index += 1
         current_batch = batch
         out_path = output_dir / f"{RAW_OUTPUT_PREFIX}_{file_index:04d}.json"
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(json_dumps(current_batch))
+        atomic_write_text(out_path, json_dumps(current_batch))
         processed_ids = [
             str(item.get("id"))
             for item in current_batch
             if isinstance(item, dict) and item.get("id") is not None
         ]
         append_checkpoint(processed_ids)
-        print(f"Đã ghi: {out_path}", flush=True)
-    print("Stage 1 (raw crawl, sync) hoàn tất.")
+        logger.info("Đã ghi: %s", out_path)
+    logger.info("Stage 1 (raw crawl, sync) hoàn tất.")
 
 
 async def run(
@@ -301,14 +383,23 @@ async def run(
     sem = asyncio.Semaphore(concurrency)
     batch: list[dict] = []
     file_index = 0
+    logger = logging.getLogger("tiki_fetcher")
+
+    try:
+        from tqdm import tqdm  # type: ignore
+    except Exception:
+        tqdm = None  # type: ignore
 
     async with aiohttp.ClientSession(
         headers={"User-Agent": "Mozilla/5.0 (compatible; TikiProductFetcher/1.0)"}
     ) as session:
         total = len(product_ids)
         done = 0
-        for i in range(0, total, concurrency * 2):
-            chunk_ids = product_ids[i : i + concurrency * 2]
+        iterator = range(0, total, concurrency * 2)
+        if tqdm is not None:
+            iterator = tqdm(iterator, desc="Stage1 chunks", unit="chunk")  # type: ignore
+        for i in iterator:  # type: ignore
+            chunk_ids = product_ids[i: i + concurrency * 2]
             tasks = [fetch_one(session, sem, pid) for pid in chunk_ids]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for r in results:
@@ -318,13 +409,12 @@ async def run(
                     batch.append(r)
                 done += 1
                 if done % 500 == 0 or done == total:
-                    print(f"Đã xử lý: {done}/{total}", flush=True)
+                    logger.info("Đã xử lý: %s/%s", done, total)
                 while len(batch) >= products_per_file:
                     file_index += 1
                     current_batch = batch[:products_per_file]
                     out_path = output_dir / f"{RAW_OUTPUT_PREFIX}_{file_index:04d}.json"
-                    with open(out_path, "w", encoding="utf-8") as f:
-                        f.write(json_dumps(current_batch))
+                    atomic_write_text(out_path, json_dumps(current_batch))
                     processed_ids = [
                         str(item.get("id"))
                         for item in current_batch
@@ -332,24 +422,33 @@ async def run(
                     ]
                     append_checkpoint(processed_ids)
                     batch = batch[products_per_file:]
-                    print(f"Đã ghi: {out_path}", flush=True)
+                    logger.info("Đã ghi: %s", out_path)
         if batch:
             file_index += 1
             current_batch = batch
             out_path = output_dir / f"{RAW_OUTPUT_PREFIX}_{file_index:04d}.json"
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(json_dumps(current_batch))
+            atomic_write_text(out_path, json_dumps(current_batch))
             processed_ids = [
                 str(item.get("id"))
                 for item in current_batch
                 if isinstance(item, dict) and item.get("id") is not None
             ]
             append_checkpoint(processed_ids)
-            print(f"Đã ghi: {out_path}", flush=True)
-    print("Stage 1 (raw crawl, async) hoàn tất.")
+            logger.info("Đã ghi: %s", out_path)
+    logger.info("Stage 1 (raw crawl, async) hoàn tất.")
 
 
 def main():
+    load_dotenv()
+    global PRODUCTS_PER_FILE, CONCURRENT_REQUESTS, REQUEST_TIMEOUT, MAX_REQUESTS_PER_SECOND
+    PRODUCTS_PER_FILE = _env_int("PRODUCTS_PER_FILE", PRODUCTS_PER_FILE)
+    CONCURRENT_REQUESTS = _env_int("CONCURRENT_REQUESTS", CONCURRENT_REQUESTS)
+    REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", REQUEST_TIMEOUT)
+    MAX_REQUESTS_PER_SECOND = _env_int("MAX_REQUESTS_PER_SECOND", MAX_REQUESTS_PER_SECOND)
+
+    logger = setup_logging(LOGS_DIR / "stage1.log")
+    logger.info("Khởi động Stage 1 (raw crawl)")
+
     parser = argparse.ArgumentParser(description="Tải thông tin sản phẩm Tiki, lưu JSON.")
     parser.add_argument(
         "--ids-file",
@@ -385,23 +484,22 @@ def main():
 
     if args.ids_file and args.ids_file.exists():
         product_ids = load_product_ids_from_file(args.ids_file)
-        print(f"Đã đọc {len(product_ids)} product ID từ file: {args.ids_file}")
+        logger.info("Đã đọc %s product ID từ file: %s", len(product_ids), args.ids_file)
     else:
         if args.ids_file:
-            print(f"File không tồn tại: {args.ids_file}. Thử tải từ OneDrive...")
+            logger.warning("File không tồn tại: %s. Thử tải từ OneDrive...", args.ids_file)
         try:
             if HAS_AIOHTTP:
                 product_ids = asyncio.run(download_product_ids_from_onedrive(args.onedrive_url))
             else:
                 product_ids = download_product_ids_from_onedrive_sync(args.onedrive_url)
-            print(f"Đã tải {len(product_ids)} product ID từ OneDrive.")
+            logger.info("Đã tải %s product ID từ OneDrive.", len(product_ids))
         except Exception as e:
-            print(f"Lỗi tải OneDrive: {e}", file=sys.stderr)
-            print("Vui lòng tải file danh sách product ID từ OneDrive và chỉ định --ids-file=<đường_dẫn>", file=sys.stderr)
+            logger.error("Lỗi tải OneDrive: %s", e)
             sys.exit(1)
 
     if not product_ids:
-        print("Không có product ID nào.", file=sys.stderr)
+        logger.error("Không có product ID nào.")
         sys.exit(1)
 
     # Áp dụng checkpoint: bỏ qua những ID đã xử lý ở lần chạy trước
@@ -411,9 +509,9 @@ def main():
         product_ids = [pid for pid in product_ids if pid not in processed_ids]
         after = len(product_ids)
         skipped = before - after
-        print(f"Checkpoint: bỏ qua {skipped} ID đã xử lý, còn lại {after} ID cần crawl.")
+        logger.info("Checkpoint: bỏ qua %s ID đã xử lý, còn lại %s ID cần crawl.", skipped, after)
     else:
-        print("Checkpoint: chưa có file checkpoint, crawl toàn bộ danh sách ID.")
+        logger.info("Checkpoint: chưa có file checkpoint, crawl toàn bộ danh sách ID.")
 
     if HAS_AIOHTTP:
         asyncio.run(
@@ -425,7 +523,7 @@ def main():
             )
         )
     else:
-        print("(Chạy ở chế độ sync với ThreadPoolExecutor vì chưa cài aiohttp. Cài aiohttp để nhanh hơn.)")
+        logger.warning("Chạy ở chế độ sync với ThreadPoolExecutor vì chưa cài aiohttp. Cài aiohttp để nhanh hơn.")
         run_sync(
             product_ids,
             output_dir=args.output_dir,
